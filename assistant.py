@@ -1,6 +1,4 @@
 import getpass
-import os
-from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 import openai
 import uuid
@@ -8,44 +6,28 @@ from langsmith.wrappers import wrap_openai
 from langsmith import traceable
 from agent_tools import fetch_user_flight_information, search_flights, update_ticket_to_new_flight, cancel_ticket, lookup_policy
 from helper_functions import update_dates
-import os
-import sqlite3
-import pandas as pd
-import requests
-from typing import Annotated
-import re
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableLambda
-
+from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import ToolNode
-from datetime import date, datetime
-from typing import Optional
-
 import pytz
-from langchain_core.runnables import RunnableConfig
 import os
-
 import sqlite3
-
+from datetime import date, datetime
 import pandas as pd
 import requests
-
 import shutil
-import sqlite3
-import pandas as pd
-import requests
-from typing import Annotated
+from typing import Annotated, Optional
 import re
-
 import numpy as np
-import openai
 from langchain_core.tools import tool
-
 from typing_extensions import TypedDict
-
 from langgraph.graph.message import AnyMessage, add_messages
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, StateGraph, START
+from langgraph.prebuilt import tools_condition
 load_dotenv()
 
 def _set_env(var: str):
@@ -70,6 +52,7 @@ def _print_event(event: dict, _printed: set, max_length=1500):
 
 class State(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
+    user_info: str # ADDING a user_info field to the state. The bot should be situationally aware of the user's situation before starting the conversation. Not going to look for user's flights in the middle of the conversation...
 
 
 db_url = "https://storage.googleapis.com/benchmarks-artifacts/travel-db/travel2.sqlite"
@@ -85,18 +68,12 @@ if overwrite or not os.path.exists(local_file):
     # Backup - we will use this to "reset" our DB in each section
     shutil.copy(local_file, backup_file)
 
-db = update_dates(local_file)
-
-
 class Assistant:
     def __init__(self, runnable: Runnable):
         self.runnable = runnable
 
     def __call__(self, state: State, config: RunnableConfig):
         while True:
-            configuration = config.get("configurable", {})
-            passenger_id = configuration.get("passenger_id", None)
-            state = {**state, "user_info": passenger_id}
             result = self.runnable.invoke(state)
             # If the LLM happens to return an empty response, we will re-prompt it
             # for an actual response.
@@ -111,10 +88,7 @@ class Assistant:
                 break
         return {"messages": result}
 
-from langchain_openai import ChatOpenAI
 llm = ChatOpenAI(model="gpt-4o-mini")
-
-from datetime import date, datetime
 
 primary_assistant_prompt = ChatPromptTemplate.from_messages(
     [
@@ -132,7 +106,7 @@ primary_assistant_prompt = ChatPromptTemplate.from_messages(
 ).partial(time=datetime.now)
 
 
-part_1_tools = [
+part_2_tools = [
     lookup_policy,
     fetch_user_flight_information,
     search_flights,
@@ -140,7 +114,7 @@ part_1_tools = [
     cancel_ticket,
 
 ]
-part_1_assistant_runnable = primary_assistant_prompt | llm.bind_tools(part_1_tools)
+part_2_assistant_runnable = primary_assistant_prompt | llm.bind_tools(part_2_tools)
 
 
 
@@ -163,28 +137,40 @@ def create_tool_node_with_fallback(tools: list) -> dict:
         [RunnableLambda(handle_tool_error)], exception_key="error"
     )
 
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, StateGraph, START
-from langgraph.prebuilt import tools_condition
+
 
 builder = StateGraph(State)
 
+#NEW : add a user_info field to the state
 
-# Define nodes: these do the work
-builder.add_node("assistant", Assistant(part_1_assistant_runnable))
-builder.add_node("tools", create_tool_node_with_fallback(part_1_tools))
-# Define edges: these determine how the control flow moves
-builder.add_edge(START, "assistant")
+def user_info(state: State):
+    return {"user_info": fetch_user_flight_information.invoke({})}
+
+# NEW: The fetch_user_info node runs first, meaning our assistant can see the user's flight information without
+# having to take an action
+builder.add_node("fetch_user_info", user_info)
+builder.add_edge(START, "fetch_user_info")
+builder.add_node("assistant", Assistant(part_2_assistant_runnable))
+builder.add_node("tools", create_tool_node_with_fallback(part_2_tools))
+builder.add_edge("fetch_user_info", "assistant")
 builder.add_conditional_edges(
     "assistant",
     tools_condition,
 )
 builder.add_edge("tools", "assistant")
 
+
 # The checkpointer lets the graph persist its state
 # this is a complete memory for the entire graph.
 memory = MemorySaver()
-part_1_graph = builder.compile(checkpointer=memory)
+
+# NEW : The graph will always halt before executing the "tools" node.
+part_2_graph = builder.compile(checkpointer=memory,
+    # NEW: The graph will always halt before executing the "tools" node.
+    # The user can approve or reject (or even alter the request) before
+    # the assistant continues
+    interrupt_before=["tools"],
+    )
 
 #from IPython.display import Image, display
 
@@ -196,10 +182,8 @@ part_1_graph = builder.compile(checkpointer=memory)
 
 # Let's create an example conversation a user might have with the assistant
 tutorial_questions = ['Hello, can I get an invoice for my flight?', 'What is the policy if I want to get a refund?', 'I changed my mind, when exactly is my flight? Is there a way to change it for the next one?']
+#tutorial_questions = ['Hello, what is the refund policy in case I need to cancel my flight?']
 
-
-# Update with the backup file so we can restart from the original place in each section
-#db = update_dates(db)
 thread_id = str(uuid.uuid4())
 
 config = {
@@ -214,9 +198,43 @@ config = {
 
 _printed = set()
 for question in tutorial_questions:
-    events = part_1_graph.stream(
+    events = part_2_graph.stream(
         {"messages": ("user", question)}, config, stream_mode="values"
     )
     for event in events:
         _print_event(event, _printed)
+
+    snapshot = part_2_graph.get_state(config)
+    while snapshot.next:
+        # We have an interrupt! The agent is trying to use a tool, and the user can approve or deny it
+        # Note: This code is all outside of your graph. Typically, you would stream the output to a UI.
+        # Then, you would have the frontend trigger a new run via an API call when the user has provided input.
+            try:
+                user_input = input(
+                "Do you approve of the above actions? Type 'y' to continue;"
+                " otherwise, explain your requested changes.\n\n"
+            )
+            except:
+                user_input = "y"
+            if user_input.strip() == "y":
+                # Just continue
+                result = part_2_graph.invoke(
+                    None,
+                    config,
+                )
+            else:
+                # Satisfy the tool invocation by
+                # providing instructions on the requested changes / change of mind
+                result = part_2_graph.invoke(
+                    {
+                    "messages": [
+                        ToolMessage(
+                            tool_call_id=event["messages"][-1].tool_calls[0]["id"],
+                            content=f"API call denied by user. Reasoning: '{user_input}'. Continue assisting, accounting for the user's input.",
+                        )
+                    ]
+                },
+                config,
+            )
+            snapshot = part_2_graph.get_state(config)
 
