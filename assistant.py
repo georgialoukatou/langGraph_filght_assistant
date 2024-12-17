@@ -12,6 +12,7 @@ from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import tools_condition
 import pytz
 import os
 import sqlite3
@@ -106,18 +107,23 @@ primary_assistant_prompt = ChatPromptTemplate.from_messages(
 ).partial(time=datetime.now)
 
 
-part_2_tools = [
+part_3_safe_tools = [
     lookup_policy,
     fetch_user_flight_information,
     search_flights,
+]
+
+part_3_sensitive_tools = [
     update_ticket_to_new_flight,
     cancel_ticket,
-
 ]
-part_2_assistant_runnable = primary_assistant_prompt | llm.bind_tools(part_2_tools)
+
+sensitive_tool_names = {t.name for t in part_3_sensitive_tools}
 
 
-
+part_3_assistant_runnable = primary_assistant_prompt | llm.bind_tools(
+    part_3_safe_tools + part_3_sensitive_tools
+)
 
 def handle_tool_error(state) -> dict:
     error = state.get("error")
@@ -146,31 +152,56 @@ builder = StateGraph(State)
 def user_info(state: State):
     return {"user_info": fetch_user_flight_information.invoke({})}
 
-# NEW: The fetch_user_info node runs first, meaning our assistant can see the user's flight information without
+# The fetch_user_info node runs first, meaning our assistant can see the user's flight information without
 # having to take an action
 builder.add_node("fetch_user_info", user_info)
 builder.add_edge(START, "fetch_user_info")
-builder.add_node("assistant", Assistant(part_2_assistant_runnable))
-builder.add_node("tools", create_tool_node_with_fallback(part_2_tools))
-builder.add_edge("fetch_user_info", "assistant")
-builder.add_conditional_edges(
-    "assistant",
-    tools_condition,
-)
-builder.add_edge("tools", "assistant")
+builder.add_node("assistant", Assistant(part_3_assistant_runnable))
+#builder.add_node("tools", create_tool_node_with_fallback(part_2_tools))
 
+# NEW: Two separate nodes for safe tools and sensitive tools
+builder.add_node("safe_tools", create_tool_node_with_fallback(part_3_safe_tools))
+builder.add_node(
+    "sensitive_tools", create_tool_node_with_fallback(part_3_sensitive_tools)
+)
+builder.add_edge("fetch_user_info", "assistant")
+
+#NEW: add route_tools function
+
+def route_tools(state: State):
+    next_node = tools_condition(state)
+    # If no tools are invoked, return to the user
+    if next_node == END:
+        return END
+    ai_message = state["messages"][-1]
+    # This assumes single tool calls. To handle parallel tool calling, you'd want to
+    # use an ANY condition
+    first_tool_call = ai_message.tool_calls[0]
+    if first_tool_call["name"] in sensitive_tool_names:
+        return "sensitive_tools"
+    return "safe_tools"
+
+builder.add_conditional_edges(
+    "assistant", route_tools, ["safe_tools", "sensitive_tools", END]
+)
+
+builder.add_edge("safe_tools", "assistant")
+builder.add_edge("sensitive_tools", "assistant")
+
+
+memory = MemorySaver()
+part_3_graph = builder.compile(
+    checkpointer=memory,
+    # NEW: The graph will always halt before executing the "tools" node.
+    # The user can approve or reject (or even alter the request) before
+    # the assistant continues
+    interrupt_before=["sensitive_tools"],
+)
 
 # The checkpointer lets the graph persist its state
 # this is a complete memory for the entire graph.
 memory = MemorySaver()
 
-# NEW : The graph will always halt before executing the "tools" node.
-part_2_graph = builder.compile(checkpointer=memory,
-    # NEW: The graph will always halt before executing the "tools" node.
-    # The user can approve or reject (or even alter the request) before
-    # the assistant continues
-    interrupt_before=["tools"],
-    )
 
 #from IPython.display import Image, display
 
@@ -181,7 +212,7 @@ part_2_graph = builder.compile(checkpointer=memory,
 #    pass
 
 # Let's create an example conversation a user might have with the assistant
-tutorial_questions = ['Hello, can I get an invoice for my flight?', 'What is the policy if I want to get a refund?', 'I changed my mind, when exactly is my flight? Is there a way to change it for the next one?']
+tutorial_questions = ['Hello, can I get an invoice for my flight?', 'What is the policy if I want to get a refund?', 'I changed my mind, when exactly is my flight? Is there a way to change it for the day before?']
 #tutorial_questions = ['Hello, what is the refund policy in case I need to cancel my flight?']
 
 thread_id = str(uuid.uuid4())
@@ -198,13 +229,13 @@ config = {
 
 _printed = set()
 for question in tutorial_questions:
-    events = part_2_graph.stream(
+    events = part_3_graph.stream(
         {"messages": ("user", question)}, config, stream_mode="values"
     )
     for event in events:
         _print_event(event, _printed)
 
-    snapshot = part_2_graph.get_state(config)
+    snapshot = part_3_graph.get_state(config)
     while snapshot.next:
         # We have an interrupt! The agent is trying to use a tool, and the user can approve or deny it
         # Note: This code is all outside of your graph. Typically, you would stream the output to a UI.
@@ -218,14 +249,14 @@ for question in tutorial_questions:
                 user_input = "y"
             if user_input.strip() == "y":
                 # Just continue
-                result = part_2_graph.invoke(
+                result = part_3_graph.invoke(
                     None,
                     config,
                 )
             else:
                 # Satisfy the tool invocation by
                 # providing instructions on the requested changes / change of mind
-                result = part_2_graph.invoke(
+                result = part_3_graph.invoke(
                     {
                     "messages": [
                         ToolMessage(
@@ -236,5 +267,5 @@ for question in tutorial_questions:
                 },
                 config,
             )
-            snapshot = part_2_graph.get_state(config)
+            snapshot = part_3_graph.get_state(config)
 
