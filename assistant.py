@@ -48,6 +48,17 @@ from typing_extensions import TypedDict
 from langgraph.graph.message import AnyMessage, add_messages
 load_dotenv()
 
+import streamlit as st
+import uuid
+#from assistant import part_1_graph  # Import the graph from your assistant code
+from langchain_core.messages import ToolMessage
+
+st.set_page_config(page_title="Swiss Airlines Customer Assistant", layout="wide")
+st.title("✈️ Swiss Airlines Customer Assistant")
+
+
+
+
 def _set_env(var: str):
     if not os.environ.get(var):
         os.environ[var] = getpass.getpass(f"{var}: ")
@@ -61,11 +72,15 @@ def _print_event(event: dict, _printed: set, max_length=1500):
         if isinstance(message, list):
             message = message[-1]
         if message.id not in _printed:
-            msg_repr = message.pretty_repr(html=True)
+            print("Response: " + str(message))
+            msg_repr = message.pretty_repr(html=False)
             if len(msg_repr) > max_length:
                 msg_repr = msg_repr[:max_length] + " ... (truncated)"
             print(msg_repr)
             _printed.add(message.id)
+            msg_content = getattr(message, "content", msg_repr)
+            return msg_content
+
 
 
 class State(TypedDict):
@@ -143,8 +158,6 @@ part_1_tools = [
 part_1_assistant_runnable = primary_assistant_prompt | llm.bind_tools(part_1_tools)
 
 
-
-
 def handle_tool_error(state) -> dict:
     error = state.get("error")
     tool_calls = state["messages"][-1].tool_calls
@@ -213,10 +226,61 @@ config = {
 }
 
 _printed = set()
-for question in tutorial_questions:
-    events = part_1_graph.stream(
-        {"messages": ("user", question)}, config, stream_mode="values"
-    )
-    for event in events:
-        _print_event(event, _printed)
 
+#for question in tutorial_questions:
+#    events = part_1_graph.stream(
+#        {"messages": ("user", question)}, config, stream_mode="values"
+#    )
+#    for event in events:
+#        _print_event(event, _printed)
+
+
+# Streamlit app configuration
+if "conversation_history" not in st.session_state:
+    st.session_state["conversation_history"] = []  # List to store the chat history
+
+# Chat input
+user_input = st.chat_input("How can I assist you today?")
+
+if user_input:
+
+    # Append the user's message to the conversation history
+    st.session_state["conversation_history"].append({"role": "user", "content": user_input})
+
+    # Stream events and collect responses
+    events = part_1_graph.stream(
+        {"messages": ("user", user_input)}, config, stream_mode="values"
+    )
+
+
+    # Placeholder for the final assistant response
+    assistant_response = ""
+
+    # Process events and extract response
+    for event in events:
+        output = _print_event(event, _printed)
+        if output:  # Check if there is valid content
+            assistant_response = output  # Capture the last response
+
+    # Display the user's message
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    # Display the assistant's response
+    if assistant_response:
+        st.session_state["conversation_history"].append({"role": "assistant", "content": assistant_response})
+        with st.chat_message("assistant"):
+            st.markdown(assistant_response)
+
+# Display the chat history dynamically
+for message in st.session_state["conversation_history"]:
+    with st.chat_message(message["role"]):  # Display user and assistant messages
+        st.markdown(message["content"])
+    # Process assistant response
+    #with st.spinner("Thinking..."):
+    #    response = process_input(user_input)
+
+    # Display assistant response
+    #st.session_state["messages"].append({"role": "assistant", "content": response})
+    #with st.chat_message("assistant"):
+    #    st.markdown(response)
